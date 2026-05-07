@@ -9,7 +9,7 @@
 namespace resnet {
 namespace {
 
-void ThrowIfAclError(aclError error, const char* action) {
+void CheckAcl(aclError error, const char* action) {
     if (error == ACL_SUCCESS) {
         return;
     }
@@ -25,7 +25,7 @@ void SetError(std::string* error, const std::string& message) {
 }
 
 template <typename T>
-T* ThrowIfNull(T* pointer, const char* action) {
+T* CheckNotNull(T* pointer, const char* action) {
     if (pointer != nullptr) {
         return pointer;
     }
@@ -33,7 +33,7 @@ T* ThrowIfNull(T* pointer, const char* action) {
     throw std::runtime_error(std::string(action) + " returned null");
 }
 
-void DestroyDataset(aclmdlDataset* dataset) noexcept {
+void DestroyDataset(aclmdlDataset*& dataset) noexcept {
     if (dataset == nullptr) {
         return;
     }
@@ -46,24 +46,17 @@ void DestroyDataset(aclmdlDataset* dataset) noexcept {
         }
     }
     aclmdlDestroyDataset(dataset);
+    dataset = nullptr;
 }
 
 }  // namespace
 
-AclInferContext::AclInferContext(Config config)
-    : config_(std::move(config)),
-      device_id_(config_.device_id) {}
+AclInferContext::AclInferContext(std::string model_path, int device_id)
+    : model_path_(std::move(model_path)),
+      device_id_(device_id) {}
 
 AclInferContext::~AclInferContext() {
-    if (initialized_) {
-        aclrtSetDevice(device_id_);
-    }
-    destroyDatasets();
-    destroyBuffers();
-    unloadModel();
-    if (initialized_) {
-        AclEnvironment::release(device_id_);
-    }
+    cleanup();
 }
 
 bool AclInferContext::init(std::string* error) {
@@ -74,134 +67,148 @@ bool AclInferContext::init(std::string* error) {
     if (!AclEnvironment::acquire(device_id_, error)) {
         return false;
     }
+    acl_ready_ = true;
 
     try {
-        ThrowIfAclError(aclrtSetDevice(device_id_), "aclrtSetDevice");
-
-        ThrowIfAclError(aclmdlLoadFromFile(config_.model_path.c_str(), &model_id_),
-                        "aclmdlLoadFromFile");
-        model_desc_ = ThrowIfNull(aclmdlCreateDesc(), "aclmdlCreateDesc");
-        ThrowIfAclError(aclmdlGetDesc(model_desc_, model_id_), "aclmdlGetDesc");
-
-        input_dataset_ = ThrowIfNull(aclmdlCreateDataset(), "aclmdlCreateDataset(input)");
-        const size_t input_count = aclmdlGetNumInputs(model_desc_);
-        input_buffers_.reserve(input_count);
-        for (size_t index = 0; index < input_count; ++index) {
-            ModelInput input;
-            input.size = aclmdlGetInputSizeByIndex(model_desc_, index);
-            ThrowIfAclError(
-                aclrtMalloc(&input.device_buffer, input.size, ACL_MEM_MALLOC_HUGE_FIRST),
-                "aclrtMalloc(input)");
-
-            aclDataBuffer* input_data_buffer = ThrowIfNull(
-                aclCreateDataBuffer(input.device_buffer, input.size),
-                "aclCreateDataBuffer(input)");
-            ThrowIfAclError(
-                aclmdlAddDatasetBuffer(input_dataset_, input_data_buffer),
-                "aclmdlAddDatasetBuffer(input)");
-            input_buffers_.push_back(input);
-        }
-
-        output_dataset_ = ThrowIfNull(aclmdlCreateDataset(), "aclmdlCreateDataset(output)");
-        const size_t output_count = aclmdlGetNumOutputs(model_desc_);
-        output_buffers_.reserve(output_count);
-        for (size_t index = 0; index < output_count; ++index) {
-            ModelOutput output;
-            output.size = aclmdlGetOutputSizeByIndex(model_desc_, index);
-
-            ThrowIfAclError(
-                aclrtMalloc(&output.device_buffer, output.size, ACL_MEM_MALLOC_HUGE_FIRST),
-                "aclrtMalloc(output)");
-            ThrowIfAclError(
-                aclrtMallocHost(&output.host_buffer, output.size),
-                "aclrtMallocHost(output)");
-
-            aclDataBuffer* output_data_buffer = ThrowIfNull(
-                aclCreateDataBuffer(output.device_buffer, output.size),
-                "aclCreateDataBuffer(output)");
-            ThrowIfAclError(
-                aclmdlAddDatasetBuffer(output_dataset_, output_data_buffer),
-                "aclmdlAddDatasetBuffer(output)");
-            output_buffers_.push_back(output);
-        }
+        setDevice();
+        loadModel();
+        createInputBuffers();
+        createOutputBuffers();
+        initialized_ = true;
     } catch (const std::exception& exception) {
         SetError(error, exception.what());
-        destroyDatasets();
-        destroyBuffers();
-        unloadModel();
-        AclEnvironment::release(device_id_);
+        cleanup();
         return false;
     }
 
-    initialized_ = true;
     return true;
 }
 
-void AclInferContext::copyToDevice(const void* host_data, size_t size) {
-    copyToDevice(0, host_data, size);
+size_t AclInferContext::getInputBufferSize() const {
+    if (input_buffers_.empty()) {
+        return 0;
+    }
+    return input_buffers_.front().size;
 }
 
-void AclInferContext::copyToDevice(size_t input_index,
-                                   const void* host_data,
-                                   size_t size) {
-    if (input_index >= input_buffers_.size()) {
-        throw std::runtime_error("Input index is out of range");
+void AclInferContext::run(const void* input_data, size_t input_size) {
+    if (!initialized_) {
+        throw std::runtime_error("AclInferContext is not initialized");
+    }
+    if (input_buffers_.empty()) {
+        throw std::runtime_error("Model input count is zero");
     }
 
-    const ModelInput& input = input_buffers_[input_index];
-    if (size > input.size) {
-        throw std::runtime_error("Input buffer size exceeds model input allocation");
+    ModelInput& input = input_buffers_.front();
+    if (input_size != input.size) {
+        throw std::runtime_error("Input buffer size mismatch");
     }
 
-    ThrowIfAclError(aclrtSetDevice(device_id_), "aclrtSetDevice");
-    ThrowIfAclError(aclrtMemcpy(input.device_buffer,
-                                input.size,
-                                host_data,
-                                size,
-                                ACL_MEMCPY_HOST_TO_DEVICE),
-                    "aclrtMemcpy(host_to_device)");
-}
+    setDevice();
+    CheckAcl(aclrtMemcpy(input.device_buffer,
+                         input.size,
+                         input_data,
+                         input_size,
+                         ACL_MEMCPY_HOST_TO_DEVICE),
+             "aclrtMemcpy(host_to_device)");
+    CheckAcl(aclmdlExecute(model_id_, input_dataset_, output_dataset_),
+             "aclmdlExecute");
 
-void AclInferContext::executeModel() {
-    ThrowIfAclError(aclrtSetDevice(device_id_), "aclrtSetDevice");
-    ThrowIfAclError(
-        aclmdlExecute(model_id_, input_dataset_, output_dataset_),
-        "aclmdlExecute");
-}
-
-void AclInferContext::copyToHost() {
-    ThrowIfAclError(aclrtSetDevice(device_id_), "aclrtSetDevice");
     for (auto& output : output_buffers_) {
-        ThrowIfAclError(
-            aclrtMemcpy(output.host_buffer,
-                        output.size,
-                        output.device_buffer,
-                        output.size,
-                        ACL_MEMCPY_DEVICE_TO_HOST),
-            "aclrtMemcpy(device_to_host)");
+        CheckAcl(aclrtMemcpy(output.host_buffer,
+                             output.size,
+                             output.device_buffer,
+                             output.size,
+                             ACL_MEMCPY_DEVICE_TO_HOST),
+                 "aclrtMemcpy(device_to_host)");
     }
 }
 
-void AclInferContext::copyToHost(size_t output_index,
-                                 void* host_buffer,
-                                 size_t size) {
-    if (output_index >= output_buffers_.size()) {
+const void* AclInferContext::getOutputHostBuffer(size_t index) const {
+    return outputBuffer(index).host_buffer;
+}
+
+size_t AclInferContext::getOutputSize(size_t index) const {
+    return outputBuffer(index).size;
+}
+
+void AclInferContext::setDevice() const {
+    CheckAcl(aclrtSetDevice(device_id_), "aclrtSetDevice");
+}
+
+void AclInferContext::loadModel() {
+    CheckAcl(aclmdlLoadFromFile(model_path_.c_str(), &model_id_),
+             "aclmdlLoadFromFile");
+    model_loaded_ = true;
+
+    model_desc_ = CheckNotNull(aclmdlCreateDesc(), "aclmdlCreateDesc");
+    CheckAcl(aclmdlGetDesc(model_desc_, model_id_), "aclmdlGetDesc");
+}
+
+void AclInferContext::createInputBuffers() {
+    input_dataset_ = CheckNotNull(aclmdlCreateDataset(), "aclmdlCreateDataset(input)");
+
+    const size_t input_count = aclmdlGetNumInputs(model_desc_);
+    input_buffers_.reserve(input_count);
+    for (size_t index = 0; index < input_count; ++index) {
+        ModelInput input;
+        input.size = aclmdlGetInputSizeByIndex(model_desc_, index);
+        CheckAcl(aclrtMalloc(&input.device_buffer, input.size, ACL_MEM_MALLOC_HUGE_FIRST),
+                 "aclrtMalloc(input)");
+
+        aclDataBuffer* buffer = CheckNotNull(
+            aclCreateDataBuffer(input.device_buffer, input.size),
+            "aclCreateDataBuffer(input)");
+        CheckAcl(aclmdlAddDatasetBuffer(input_dataset_, buffer),
+                 "aclmdlAddDatasetBuffer(input)");
+        input_buffers_.push_back(input);
+    }
+}
+
+void AclInferContext::createOutputBuffers() {
+    output_dataset_ = CheckNotNull(aclmdlCreateDataset(), "aclmdlCreateDataset(output)");
+
+    const size_t output_count = aclmdlGetNumOutputs(model_desc_);
+    output_buffers_.reserve(output_count);
+    for (size_t index = 0; index < output_count; ++index) {
+        ModelOutput output;
+        output.size = aclmdlGetOutputSizeByIndex(model_desc_, index);
+
+        CheckAcl(aclrtMalloc(&output.device_buffer, output.size, ACL_MEM_MALLOC_HUGE_FIRST),
+                 "aclrtMalloc(output)");
+        CheckAcl(aclrtMallocHost(&output.host_buffer, output.size),
+                 "aclrtMallocHost(output)");
+
+        aclDataBuffer* buffer = CheckNotNull(
+            aclCreateDataBuffer(output.device_buffer, output.size),
+            "aclCreateDataBuffer(output)");
+        CheckAcl(aclmdlAddDatasetBuffer(output_dataset_, buffer),
+                 "aclmdlAddDatasetBuffer(output)");
+        output_buffers_.push_back(output);
+    }
+}
+
+const AclInferContext::ModelOutput& AclInferContext::outputBuffer(size_t index) const {
+    if (index >= output_buffers_.size()) {
         throw std::runtime_error("Output index is out of range");
     }
+    return output_buffers_[index];
+}
 
-    ModelOutput& output = output_buffers_[output_index];
-    if (size > output.size) {
-        throw std::runtime_error("Requested output size exceeds model output allocation");
+void AclInferContext::cleanup() noexcept {
+    if (acl_ready_) {
+        aclrtSetDevice(device_id_);
     }
 
-    ThrowIfAclError(aclrtSetDevice(device_id_), "aclrtSetDevice");
-    ThrowIfAclError(
-        aclrtMemcpy(host_buffer,
-                    size,
-                    output.device_buffer,
-                    size,
-                    ACL_MEMCPY_DEVICE_TO_HOST),
-        "aclrtMemcpy(device_to_host_direct)");
+    destroyDatasets();
+    destroyBuffers();
+    unloadModel();
+    initialized_ = false;
+
+    if (acl_ready_) {
+        AclEnvironment::release(device_id_);
+        acl_ready_ = false;
+    }
 }
 
 aclmdlIODims AclInferContext::getInputDims(size_t input_index) const {
@@ -210,7 +217,7 @@ aclmdlIODims AclInferContext::getInputDims(size_t input_index) const {
     }
 
     aclmdlIODims dims{};
-    ThrowIfAclError(aclmdlGetInputDims(model_desc_, input_index, &dims), "aclmdlGetInputDims");
+    CheckAcl(aclmdlGetInputDims(model_desc_, input_index, &dims), "aclmdlGetInputDims");
     return dims;
 }
 
@@ -220,7 +227,7 @@ aclmdlIODims AclInferContext::getOutputDims(size_t output_index) const {
     }
 
     aclmdlIODims dims{};
-    ThrowIfAclError(aclmdlGetOutputDims(model_desc_, output_index, &dims), "aclmdlGetOutputDims");
+    CheckAcl(aclmdlGetOutputDims(model_desc_, output_index, &dims), "aclmdlGetOutputDims");
     return dims;
 }
 
@@ -230,7 +237,7 @@ aclmdlIODims AclInferContext::getCurrentOutputDims(size_t output_index) const {
     }
 
     aclmdlIODims dims{};
-    ThrowIfAclError(
+    CheckAcl(
         aclmdlGetCurOutputDims(model_desc_, output_index, &dims),
         "aclmdlGetCurOutputDims");
     return dims;
@@ -269,18 +276,17 @@ void AclInferContext::unloadModel() noexcept {
         aclmdlDestroyDesc(model_desc_);
         model_desc_ = nullptr;
     }
-    if (model_id_ != 0) {
+
+    if (model_loaded_) {
         aclmdlUnload(model_id_);
         model_id_ = 0;
+        model_loaded_ = false;
     }
 }
 
 void AclInferContext::destroyDatasets() noexcept {
     DestroyDataset(input_dataset_);
-    input_dataset_ = nullptr;
-
     DestroyDataset(output_dataset_);
-    output_dataset_ = nullptr;
 }
 
 void AclInferContext::destroyBuffers() noexcept {
@@ -316,8 +322,7 @@ std::vector<std::shared_ptr<GryFlux::Context>> CreateAclInferContexts(
     std::vector<std::shared_ptr<GryFlux::Context>> contexts;
     contexts.reserve(instance_count);
     for (size_t index = 0; index < instance_count; ++index) {
-        auto context = std::make_shared<AclInferContext>(
-            AclInferContext::Config{om_model_path, device_id});
+        auto context = std::make_shared<AclInferContext>(om_model_path, device_id);
         std::string init_error;
         if (!context->init(&init_error)) {
             throw std::runtime_error("AclInferContext init failed: " + init_error);

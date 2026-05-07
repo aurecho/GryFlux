@@ -7,10 +7,10 @@
 - 如何在 GryFlux 中搭建基于 Atlas NPU 的图像分类异步流水线
 - 如何通过 `DataSource -> DAG -> DataConsumer` 组织批量评估流程
 - 如何把预处理、推理、后处理拆分为独立节点并行调度
-- 如何使用 `ResourcePool` 注册双 Atlas 设备资源并自动分发推理任务
+- 如何使用 `ResourcePool` 注册 Atlas NPU 资源并自动分发推理任务
 - 如何在全部样本完成后统一统计 Top-1 / Top-5 / FPS
 
-本应用入口在 `src/app/resnet_Atlas/resnet_Atlas.cpp`，可执行文件名为 `resnet_atlas`。
+本应用入口在 `src/app/resnet_Atlas/resnet_Atlas.cpp`，可执行文件名为 `resnet_Atlas`。
 
 ## 快速上手
 
@@ -57,7 +57,7 @@ struct ResNetPacket : public GryFlux::DataPacket {
 
 - `InputNode`
 - `PreprocessNode`
-- `ResNetInferNode`
+- `InferNode`
 - `PostprocessNode`
 - `OutputNode`
 
@@ -88,16 +88,18 @@ const float MEAN_RGB[3] = {0.485f, 0.456f, 0.406f};
 const float STD_RGB[3]  = {0.229f, 0.224f, 0.225f};
 ```
 
-#### 2.2 `ResNetInferNode`
+#### 2.2 `InferNode`
 
-`ResNetInferNode` 的职责很简单，就是把 packet 中的输入 tensor 交给 `AtlasContext` 执行推理：
+`InferNode` 的职责很简单，就是把 packet 中的输入 tensor 交给 `AclInferContext` 执行推理：
 
 ```cpp
-void ResNetInferNode::execute(GryFlux::DataPacket &packet, GryFlux::Context &ctx) {
-    auto &p = static_cast<ResNetPacket&>(packet);
-    auto &atlasCtx = static_cast<AtlasContext&>(ctx);
+void InferNode::execute(GryFlux::DataPacket& packet, GryFlux::Context& ctx) {
+    auto& resnet_packet = static_cast<ResNetPacket&>(packet);
+    auto& infer_context = static_cast<resnet::AclInferContext&>(ctx);
 
-    atlasCtx.executeInference(p.preprocessed_data, p.logits);
+    const size_t input_bytes =
+        resnet_packet.preprocessed_data.size() * sizeof(float);
+    infer_context.run(resnet_packet.preprocessed_data.data(), input_bytes);
 }
 ```
 
@@ -124,59 +126,54 @@ p.top1_class = score_index_pairs[0].second;
 ### 3) 定义 Context（资源上下文）
 
 当某个节点需要“受限硬件资源”时，需要定义一个 `GryFlux::Context` 子类。  
-本示例中的资源上下文就是 `AtlasContext`。
+本示例中的资源上下文是 `AclInferContext`。
 
-`AtlasContext` 封装了：
+它整体参考了 `ct/OmModelRunner` 的职责划分，但保留的是更贴合当前分类示例的简化版。当前封装了：
 
-- ACL Device / Context
-- 模型 ID 和模型描述
-- 输入输出显存
-- 输入输出 dataset / buffer
+- ACL 全局生命周期接入
+- OM 模型加载与 `model_desc`
+- 输入输出 device buffer
+- 输入输出 dataset / data buffer
+- 单次 `run()` 推理路径
 
-构造阶段会完成：
+初始化阶段会完成：
 
+- `AclEnvironment::acquire()`
 - `aclrtSetDevice`
-- `aclrtCreateContext`
 - `aclmdlLoadFromFile`
 - `aclmdlGetDesc`
 - 输入输出显存分配
 - dataset / data buffer 创建
 
-推理接口为：
+推理接口现在收敛为：
 
 ```cpp
-void executeInference(const std::vector<float>& host_input, std::vector<float>& host_output) {
-    std::lock_guard<std::mutex> lock(npu_mutex_);
-
-    ACL_CHECK(aclrtSetCurrentContext(context_));
-    if (host_input.size() * sizeof(float) != inputSize_) {
-        throw std::runtime_error("host_input size mismatch");
-    }
-    ACL_CHECK(aclrtMemcpy(inputDevBuffer_, inputSize_, host_input.data(), inputSize_, ACL_MEMCPY_HOST_TO_DEVICE));
-    ACL_CHECK(aclmdlExecute(modelId_, inputDataset_, outputDataset_));
-    ACL_CHECK(aclrtMemcpy(host_output.data(), outputSize_, outputDevBuffer_, outputSize_, ACL_MEMCPY_DEVICE_TO_HOST));
-}
+void run(const void* input_data, size_t input_size);
 ```
 
-这里加了一把互斥锁，确保单个 `AtlasContext` 不会被多个线程同时打到底层驱动。
+调用 `run()` 时会在内部完成：
+
+- Host -> Device 拷贝
+- `aclmdlExecute`
+- Device -> Host 拷贝
 
 ### 4) 注册资源池（ResourcePool）
 
 当节点需要 Atlas NPU 资源时，先注册对应资源类型。
 
-当前示例注册了两张设备：
+当前示例注册了同一张设备上的两个推理上下文：
 
 ```cpp
 auto resourcePool = std::make_shared<GryFlux::ResourcePool>();
-std::vector<std::shared_ptr<GryFlux::Context>> atlas_contexts;
-
-atlas_contexts.push_back(std::make_shared<AtlasContext>(0, omModelPath));
-atlas_contexts.push_back(std::make_shared<AtlasContext>(1, omModelPath));
-
-resourcePool->registerResourceType("atlas_npu", std::move(atlas_contexts));
+resource_pool->registerResourceType(
+    "npu",
+    resnet::CreateAclInferContexts(
+        options.model_path,
+        0,
+        kNpuInstanceCount));
 ```
 
-这意味着 `inference` 节点在运行时可以从 `atlas_npu` 资源池中自动获取一个可用上下文，实现双卡轮转。
+这意味着 `inference` 节点在运行时会从 `npu` 资源池中获取一个可用上下文。当前主程序默认只注册 `device 0` 上的 2 个实例，不是双卡轮转。
 
 ### 5) 构建 DAG（GraphTemplate + TemplateBuilder）
 
@@ -193,7 +190,7 @@ auto graphTemplate = GryFlux::GraphTemplate::buildOnce(
     [](GryFlux::TemplateBuilder *builder) {
         builder->setInputNode<InputNode>("input");
         builder->addTask<PreprocessNode>("preprocess", "", {"input"});
-        builder->addTask<ResNetInferNode>("inference", "atlas_npu", {"preprocess"});
+        builder->addTask<PipelineNodes::InferNode>("inference", "npu", {"preprocess"});
         builder->addTask<PostprocessNode>("postprocess", "", {"inference"});
         builder->setOutputNode<OutputNode>("output", {"postprocess"});
     }
@@ -251,8 +248,8 @@ DAG 结构图：
 
 - `source`：`ResNetDataSource`
 - `packet`：`ResNetPacket`
-- `nodes`：`InputNode -> PreprocessNode -> ResNetInferNode -> PostprocessNode -> OutputNode`
-- `context`：`AtlasContext`
+- `nodes`：`InputNode -> PreprocessNode -> InferNode -> PostprocessNode -> OutputNode`
+- `context`：`AclInferContext`
 - `consumer`：`ResNetResultConsumer`
 
 ## 资源绑定
@@ -260,17 +257,16 @@ DAG 结构图：
 当前资源绑定如下：
 
 - `CPU(绿)`：`PreprocessNode`、`PostprocessNode`
-- `Atlas NPU(蓝)`：`ResNetInferNode`
+- `Atlas NPU(蓝)`：`InferNode`
 
-其中 `AtlasContext` 注册了两个实例：
+其中 `AclInferContext` 当前注册了两个实例：
 
 - `Device 0`
-- `Device 1`
 
 这意味着：
 
 - 预处理 / 后处理由 CPU 线程池并发执行
-- 推理阶段由双卡 Atlas 上下文并行承载
+- 推理阶段由同一张 Atlas 设备上的两个上下文并行承载
 
 ## 预处理与后处理逻辑
 
@@ -299,29 +295,31 @@ constexpr size_t kMaxActivePackets = 16;
 如果要分析吞吐，通常需要一起考虑：
 
 - CPU 预处理速度
-- 双卡 NPU 推理吞吐
+- 单卡多上下文 NPU 推理吞吐
 - `kMaxActivePackets` 是否足够覆盖系统在途深度
 
 ## 构建与运行
 
 ### 1) 构建
 
-在仓库根目录执行：
+当前仓库顶层 `build.sh` 只会构建 `src/app/example`。  
+如果要构建 `resnet_Atlas`，建议单独构建这个子目录：
 
 ```bash
-bash build.sh
+cmake -S src/app/resnet_Atlas -B build/resnet_Atlas
+cmake --build build/resnet_Atlas -j"$(nproc)"
 ```
 
-构建完成后，可执行文件位于：
+可执行文件位于：
 
 ```bash
-build/src/app/resnet_Atlas/resnet_atlas
+build/resnet_Atlas/resnet_Atlas
 ```
 
 ### 2) 运行
 
 ```bash
-./build/src/app/resnet_Atlas/resnet_atlas <om_model_path> <dataset_dir> <gt_file_path>
+/root/workspace/zjx/GryFlux/build/resnet_Atlas/resnet_Atlas -m <om_model_path> -d <dataset_dir> -g <gt_file_path>
 ```
 
 程序启动参数共 3 个：
@@ -345,12 +343,37 @@ build/src/app/resnet_Atlas/resnet_atlas
 如果编译时启用了 profiling：
 
 ```bash
-bash build.sh --enable_profile
+cmake -S src/app/resnet_Atlas -B build/resnet_Atlas_profile -DCMAKE_CXX_FLAGS=-DGRYFLUX_BUILD_PROFILING=1
+cmake --build build/resnet_Atlas_profile -j"$(nproc)"
 ```
 
 程序运行结束后会额外输出 profiling 统计，并导出：
 
 - `graph_timeline_resnet.json`
+
+导出位置是程序启动时的当前工作目录。
+
+`graph_timeline_resnet.json` 在导出前会按事件时间戳排序，避免多线程记录时出现少量乱序，便于 timeline viewer 正确绘图。
+
+仓库中的 `assets/timeline_resnet.json` 是一份真实 profiling 样例，生成方式为：
+
+- 同一张真实图片重复 12 次
+- 先做 1 轮 warm-up
+- 再做 1 轮正式录制
+
+这份样例仍然对应真实的 5 节点执行链路：
+
+- `input`
+- `preprocess`
+- `inference`
+- `postprocess`
+- `output`
+
+之所以采用这份样例，而不是直接使用杂图混跑结果，是因为它更容易观察：
+
+- CPU `preprocess` 与双 `npu` context 的并发关系
+- `input / preprocess / inference / postprocess / output` 的真实先后顺序
+- warm-up 后更稳定的耗时分布
 
 你可以像 `example/README.md` 一样，用网页查看时间线：
 
@@ -386,10 +409,10 @@ http://profile.grifcc.top:8076/
 
 为保证“处理完成后正常退出”，当前实现采用：
 
-- GT 文件检查放在 `aclInit()` 之前
+- GT 文件检查放在资源初始化之前
 - 主线程直接调用 `pipeline.run()`
 - `DataSource` 在耗尽时正确更新 `hasMore`
-- 所有资源最终通过 `aclFinalize()` 统一释放
+- 所有 ACL 资源最终通过 `AclEnvironment` 统一释放
 
 如果出现无法退出或提前退出，优先检查：
 
@@ -404,7 +427,8 @@ http://profile.grifcc.top:8076/
 - `resnet_Atlas.cpp`: 主程序入口
 - `source/resnet_data_source.h`: 数据源
 - `packet/resnet_packet.h`: 数据包定义
-- `context/atlas_context.h`: Atlas 资源上下文
+- `context/acl_environment.h/.cpp`: ACL 生命周期管理
+- `context/acl_infer_context.h/.cpp`: Atlas 推理上下文
 - `nodes/Input/InputNode.cpp`: 输入节点
 - `nodes/Preprocess/PreprocessNode.cpp`: 图像预处理
 - `nodes/Infer/InferNode.cpp`: NPU 推理执行

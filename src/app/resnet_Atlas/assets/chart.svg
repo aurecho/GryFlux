@@ -5,6 +5,7 @@
     </marker>
     <style>
       .text { font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; text-anchor: middle; dominant-baseline: middle; font-weight: bold; }
+      .sub-text { font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; text-anchor: middle; dominant-baseline: middle; fill: #0d47a1; }
       .label-text { font-family: 'Consolas', monospace; font-size: 16px; fill: #E64A19; font-weight: 900; }
       .box { stroke-width: 2; }
       .input-output { fill: #fce4ec; stroke: #880e4f; }
@@ -41,8 +42,9 @@
   <rect x="300" y="530" width="200" height="40" rx="5" class="box cpu-box" />
   <text x="400" y="550" class="text">OutputNode</text>
 
-  <rect x="560" y="390" width="170" height="40" rx="5" class="box npu-box" />
-  <text x="645" y="410" class="text">AclInferContext x2</text>
+  <rect x="560" y="384" width="170" height="52" rx="5" class="box npu-box" />
+  <text x="645" y="404" class="text">AclInferContext x2</text>
+  <text x="645" y="420" class="sub-text">device 0 x2</text>
 
   <rect x="560" y="530" width="170" height="40" rx="5" class="box consumer-box" />
   <text x="645" y="550" class="text">ResNetResultConsumer</text>

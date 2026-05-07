@@ -23,9 +23,7 @@ void InferNode::execute(GryFlux::DataPacket& packet, GryFlux::Context& ctx) {
         return;
     }
 
-    infer_context.copyToDevice(resnet_packet.preprocessed_data.data(), input_bytes);
-    infer_context.executeModel();
-    infer_context.copyToHost();
+    infer_context.run(resnet_packet.preprocessed_data.data(), input_bytes);
 
     const size_t output_float_count = infer_context.getOutputSize(0) / sizeof(float);
     if (resnet_packet.logits.size() != output_float_count) {

@@ -14,36 +14,19 @@ namespace resnet {
 
 class AclInferContext : public GryFlux::Context {
 public:
-    struct Config {
-        std::string model_path;
-        int device_id = 0;
-    };
-
-    explicit AclInferContext(Config config);
+    AclInferContext(std::string model_path, int device_id);
     ~AclInferContext() override;
 
     bool init(std::string* error);
 
-    const Config& config() const { return config_; }
     int getDeviceId() const { return device_id_; }
 
-    size_t getNumInputs() const { return input_buffers_.size(); }
-    size_t getInputBufferSize(size_t index) const { return input_buffers_[index].size; }
-    size_t getInputBufferSize() const {
-        return input_buffers_.empty() ? 0 : input_buffers_[0].size;
-    }
-
-    void copyToDevice(const void* host_data, size_t size);
-    void copyToDevice(size_t input_index, const void* host_data, size_t size);
-    void executeModel();
-    void copyToHost();
-    void copyToHost(size_t output_index, void* host_buffer, size_t size);
+    size_t getInputBufferSize() const;
+    void run(const void* input_data, size_t input_size);
 
     size_t getNumOutputs() const { return output_buffers_.size(); }
-    void* getOutputHostBuffer(size_t index) const {
-        return output_buffers_[index].host_buffer;
-    }
-    size_t getOutputSize(size_t index) const { return output_buffers_[index].size; }
+    const void* getOutputHostBuffer(size_t index) const;
+    size_t getOutputSize(size_t index) const;
     aclmdlIODims getInputDims(size_t input_index) const;
     aclmdlIODims getOutputDims(size_t output_index) const;
     aclmdlIODims getCurrentOutputDims(size_t output_index) const;
@@ -64,12 +47,20 @@ private:
         size_t size = 0;
     };
 
+    void setDevice() const;
+    void loadModel();
+    void createInputBuffers();
+    void createOutputBuffers();
+    const ModelOutput& outputBuffer(size_t index) const;
+    void cleanup() noexcept;
     void destroyDatasets() noexcept;
     void destroyBuffers() noexcept;
     void unloadModel() noexcept;
 
-    Config config_;
+    std::string model_path_;
+    bool acl_ready_ = false;
     bool initialized_ = false;
+    bool model_loaded_ = false;
     int device_id_ = 0;
 
     uint32_t model_id_ = 0;
